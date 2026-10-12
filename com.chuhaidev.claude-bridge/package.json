@@ -1,0 +1,28 @@
+{
+  "name": "com.chuhaidev.claude-bridge",
+  "version": "0.2.0",
+  "displayName": "Claude Bridge for Unity",
+  "description": "Unofficial community tool (not made by Anthropic). Lets Claude Code drive the open Unity editor: read and build scenes and prefabs as compact text, edit components, sprites and tilemaps, play-test, screenshot, and check compile errors. Installs its own Claude Code skill into the project and adds a Claude Activity window that shows everything the agent does.",
+  "unity": "6000.0",
+  "keywords": [
+    "claude",
+    "agent",
+    "ai",
+    "automation",
+    "editor"
+  ],
+  "dependencies": {
+    "com.unity.pipeline": "0.8.0-exp.1",
+    "com.unity.modules.imageconversion": "1.0.0",
+    "com.unity.modules.imgui": "1.0.0",
+    "com.unity.modules.physics": "1.0.0",
+    "com.unity.modules.physics2d": "1.0.0",
+    "com.unity.modules.tilemap": "1.0.0"
+  },
+  "author": {
+    "name": "ChuhaiDev",
+    "url": "https://github.com/ChuhaiDev"
+  },
+  "documentationUrl": "https://github.com/ChuhaiDev/unity-claude-bridge#readme",
+  "changelogUrl": "https://github.com/ChuhaiDev/unity-claude-bridge/releases"
+}

@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""u — drive the live Unity editor (Claude Bridge).   Full guide: SKILL.md next to this file
+
+  u ls [/Path|Assets/X.prefab] [-v]   scene text: compact tree (-v: +Component k=v lines, apply-able)
+  u get <handle> [filter]             non-default properties of an object / component / asset
+  u set <handle> Comp.prop=value …    set properties (1 undo step)
+  u apply <file|-> | text=…           make scene/prefabs match scene text (atomic, 1 undo step)
+  u rm <handle> …                     delete objects or assets
+  u diff [/Path]                      what changed since the last `u diff` (e.g. the human's edits)
+  u shot [/Path | rect=x,y,w,h] [name]   render → PNG path (Read it).  u shot game | scene
+  u play [secs] [keep] [noshot]       play, screenshot, console output, stop
+  u errors | u logs [all]             new console warnings+errors | all new output
+  u note "text"                       tell the human what you're doing
+  u sync                              import + compile now (also automatic before every command)
+  u run <file.cs> [Type.Method] [args-json]   run an editor builder script in memory
+  u <any-command> positional… key=value …     u cmds [query] · u help <command>
+  u <<'EOF' … EOF                     batch: one command per line, stops at the first error;
+                                      `apply <<END` … `END` inside a batch embeds scene text
+
+Values are typed by the command's schema: 1,2,3 → [1,2,3]; key=@file reads a file; --flag → flag=true.
+Flags: --full (no output cap) --json (raw reply) --timeout=S
+"""
+import base64, difflib, hashlib, json, os, re, shlex, sys, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime
+
+def find_project():
+    """UNITY_PROJECT, else the project.txt the package's installer writes next to this script,
+    else a Unity project at/above the current directory, else one just below it."""
+    if os.environ.get("UNITY_PROJECT"):
+        return os.path.abspath(os.environ["UNITY_PROJECT"])
+    is_proj = lambda d: os.path.isfile(os.path.join(d, "ProjectSettings", "ProjectVersion.txt"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(here, "project.txt")) as f:
+            p = f.read().strip()
+        if is_proj(p):
+            return p
+    except OSError:
+        pass
+    d = os.getcwd()
+    while True:
+        if is_proj(d):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    for root, dirs, _ in os.walk(os.getcwd()):
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("Library", "node_modules", "Temp")]
+        if is_proj(root):
+            return root
+        if root.count(os.sep) - os.getcwd().count(os.sep) >= 2:
+            dirs[:] = []
+    sys.exit("u: can't find the Unity project — run from inside it, or set UNITY_PROJECT=/path/to/project")
+
+
+PROJECT = find_project()
+PORT_FILE = os.path.join(PROJECT, "Library/Pipeline/.unity-pipeline-port")
+ACTIVITY = os.path.join(PROJECT, "Library/ClaudeBridge/activity.jsonl")
+STATE = os.path.join(PROJECT, "Temp/claude")
+SCHEMA = os.path.join(STATE, "schema.json")
+STAMP = os.path.join(STATE, "sync.stamp")
+CURSOR = os.path.join(STATE, "console.cursor")
+OUTPUT_CAP = 6000
+
+READ_PREFIXES = ("get_", "list_", "find_", "search", "snapshot", "inspect", "tilemap_read", "console", "editor_status",
+                 "capture_", "screenshot", "compile_errors", "package_list", "package_search", "package_status",
+                 "recompile_status", "build_status", "test_status", "wait_status", "audit_status", "read_text_file",
+                 "runtime_status", "get_performance")
+# Files the editor won't notice on its own when written from outside. (Scenes/prefabs/.asset are
+# written by Unity itself, so they're left out.)
+SYNC_EXT = {".cs", ".asmdef", ".asmref", ".png", ".jpg", ".jpeg", ".psd", ".aseprite", ".ase", ".wav", ".ogg", ".mp3",
+            ".txt", ".json", ".shader", ".hlsl", ".cginc", ".shadergraph", ".uss", ".uxml", ".ttf", ".otf", ".fbx", ".inputactions"}
+ALIASES = {"ls": "snapshot", "get": "inspect"}
+NO_AUTOSYNC = {"sync", "note", "status", "wait", "cmds", "help", "errors", "logs", "refresh", "compile_errors", "editor_status", "console"}
+
+FULL = "--full" in sys.argv
+RAW = "--json" in sys.argv
+TIMEOUT = 60
+for a in sys.argv:
+    if a.startswith("--timeout="):
+        TIMEOUT = float(a.split("=", 1)[1])
+ARGV = [a for a in sys.argv[1:] if a not in ("--full", "--json") and not a.startswith("--timeout=")]
+
+
+class EditorDown(Exception):
+    pass
+
+
+class Fail(Exception):
+    """A command failed; message already formatted for the agent."""
+
+
+# ── transport ───────────────────────────────────────────────────────────────
+
+def descriptor():
+    try:
+        with open(PORT_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        raise EditorDown("no editor connection for %s — is the project open in Unity with the Claude Bridge package installed?" % PROJECT)
+
+
+def http(method, path, body=None, timeout=None):
+    d = descriptor()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (d["port"], path),
+        data=json.dumps(body).encode() if body is not None else None, method=method,
+        headers={"Authorization": "Bearer " + d["evalToken"], "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or TIMEOUT) as r:
+            return r.status, json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode()
+        try:
+            return e.code, json.loads(txt)
+        except ValueError:
+            return e.code, {"success": False, "error": txt}
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+        raise EditorDown(str(e))
+
+
+def call(command, params, retry_for=90.0):
+    """POST /api/exec, riding out domain reloads and busy (settling/compiling) states."""
+    deadline = time.time() + retry_for
+    while True:
+        try:
+            code, rep = http("POST", "/api/exec", {"command": command, "parameters": params})
+            if code == 503 and rep.get("retryable") and time.time() < deadline:
+                if rep.get("busyReason") == "blocked_by_dialog":
+                    dlg = (rep.get("dialogs") or [{}])[0]
+                    raise Fail("the editor is blocked by a dialog: %r %r — ask the human to dismiss it" % (dlg.get("title"), dlg.get("message")))
+                time.sleep(0.4)
+                continue
+            return rep
+        except EditorDown:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.5)
+
+
+# ── schema-driven argument binding ──────────────────────────────────────────
+
+def schema():
+    """{command: [params]} cached per editor server instance."""
+    start = descriptor().get("startedAt")
+    try:
+        with open(SCHEMA) as f:
+            cached = json.load(f)
+        if cached.get("startedAt") == start and cached.get("bridge"):
+            return cached["commands"]
+    except (OSError, ValueError):
+        pass
+    _, rep = http("GET", "/api/commands?detail=full")
+    cmds = {c["name"]: [{"name": p["name"], "type": p.get("type", ""), "required": p.get("required")} for p in c.get("parameters", [])]
+            for c in rep.get("commands", [])}
+    os.makedirs(STATE, exist_ok=True)
+    with open(SCHEMA, "w") as f:
+        json.dump({"startedAt": start, "bridge": "apply" in cmds, "commands": cmds}, f)
+    return cmds
+
+
+def invalidate_schema():
+    try:
+        os.remove(SCHEMA)
+    except OSError:
+        pass
+
+
+NUM_LIST = re.compile(r"^\(?\s*-?[\d.]+(\s*,\s*-?[\d.]+)+\s*\)?$")
+KV = re.compile(r"^([A-Za-z_][\w.\[\]#]*)=(.*)$", re.S)
+
+
+def smart(v):
+    """Untyped value: JSON if it parses, '1,2' / '(1,2)' → number list, else the raw string."""
+    if v.startswith("@") and os.path.isfile(v[1:]):
+        return open(v[1:]).read()
+    if NUM_LIST.match(v):
+        return [float(x) if "." in x else int(x) for x in v.strip("()").replace(" ", "").split(",")]
+    try:
+        return json.loads(v)
+    except ValueError:
+        return v
+
+
+def typed(v, ptype):
+    if v.startswith("@") and os.path.isfile(v[1:]):
+        return open(v[1:]).read()
+    t = ptype.lower()
+    if t in ("string", "objectref"):
+        return v
+    if t == "boolean":
+        return v.lower() in ("1", "true", "yes", "on")
+    if t in ("int32", "int64"):
+        return int(v)
+    if t in ("single", "double"):
+        return float(v)
+    if t.endswith("[]") and not v.lstrip().startswith("["):
+        parts = [p for p in re.split(r"[,\s]+", v.strip("()")) if p]
+        if t.startswith(("single", "int", "double")):
+            return [float(p) if t.startswith(("single", "double")) else int(float(p)) for p in parts]
+        return parts
+    return smart(v)
+
+
+def bind(command, args):
+    """positional + key=value (+ --flag) → params dict, using the command's parameter schema."""
+    if len(args) == 1 and args[0].lstrip().startswith("{"):
+        return json.loads(args[0])
+    params_schema = schema().get(command)
+    if params_schema is None:
+        raise Fail(unknown_command(command))
+    by_name = {p["name"]: p for p in params_schema}
+    bag = next((p["name"] for p in params_schema if p["type"] == "JObject"), None)
+    order = [p["name"] for p in params_schema if p["required"]] + [p["name"] for p in params_schema if not p["required"]]
+    params = {}
+    for a in args:
+        m = KV.match(a)
+        if a.startswith("--") and len(a) > 2 and "=" not in a:
+            key = a[2:].replace("-", "_")
+            if key not in by_name:
+                raise Fail("%s has no flag --%s; parameters: %s" % (command, key, ", ".join(by_name)))
+            params[key] = True
+        elif m and m.group(1) in by_name:
+            params[m.group(1)] = typed(m.group(2), by_name[m.group(1)]["type"])
+        elif m and bag:
+            params.setdefault(bag, {})[m.group(1)] = smart(m.group(2))
+        elif m:
+            close = difflib.get_close_matches(m.group(1), list(by_name), 3)
+            raise Fail("%s has no parameter '%s'%s. Parameters: %s" % (command, m.group(1), " — did you mean %s?" % "/".join(close) if close else "", ", ".join(by_name)))
+        else:
+            slot = next((n for n in order if n not in params and n != bag), None)
+            if slot is None:
+                raise Fail("too many positional arguments for %s (parameters: %s)" % (command, ", ".join(by_name)))
+            params[slot] = typed(a, by_name[slot]["type"])
+    return params
+
+
+def unknown_command(name):
+    names = list(schema()) + list(COMPOSITE) + list(ALIASES)
+    close = difflib.get_close_matches(name, sorted(set(names)), 4, 0.5)
+    return "unknown command '%s'%s  (u cmds <word> to search)" % (name, " — did you mean: " + ", ".join(close) + "?" if close else "")
+
+
+# ── output ──────────────────────────────────────────────────────────────────
+
+def out(text):
+    if text is None:
+        return
+    if not FULL and len(text) > OUTPUT_CAP:
+        cut = text[:OUTPUT_CAP]
+        cut = cut[:cut.rfind("\n") + 1] or cut
+        text = cut + "… output capped (%d more chars). Narrow the query, or --full.\n" % (len(text) - len(cut))
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+
+
+def identity(o):
+    """Pipeline AuthoringResult → 'Type /path'."""
+    if isinstance(o, dict) and "type" in o and ("hierarchyPath" in o or "assetPath" in o):
+        return "%s %s" % (o.get("type"), o.get("hierarchyPath") or o.get("assetPath") or "")
+    return None
+
+
+def strip(o):
+    if isinstance(o, dict):
+        return {k: strip(v) for k, v in o.items() if v is not None and k not in ("globalId", "guid", "fileId", "instanceId")}
+    if isinstance(o, list):
+        return [strip(v) for v in o]
+    return o
+
+
+def render(res):
+    if isinstance(res, dict) and isinstance(res.get("text"), str):
+        rest = {k: v for k, v in res.items() if k != "text" and v not in (None, False, "", [])}
+        return res["text"] + ("" if not rest else ("" if res["text"].endswith("\n") else "\n") + json.dumps(strip(rest), separators=(",", ":")))
+    if isinstance(res, str):
+        return res
+    if isinstance(res, dict) and "diagnostics" in res and "result" in res:  # eval-style envelope
+        diags = [d.get("message", str(d)) if isinstance(d, dict) else str(d) for d in res.get("diagnostics") or []]
+        body = res["result"] if isinstance(res["result"], str) else json.dumps(strip(res["result"]), separators=(",", ":"))
+        return "\n".join(diags + ([body] if res.get("success", True) else []))
+    ident = identity(res)
+    if ident:
+        return "ok " + ident
+    if isinstance(res, dict):
+        ids = [identity(v) for v in res.values() if isinstance(v, dict)]
+        if any(ids) and len(res) <= 3:
+            return "ok " + "; ".join(i for i in ids if i)
+        lists = [v for v in res.values() if isinstance(v, list) and v and all(identity(x) for x in v)]
+        if lists:
+            return "ok\n" + "\n".join(identity(x) for x in lists[0])
+    s = json.dumps(strip(res), separators=(",", ":"))
+    return s if len(s) < 300 else json.dumps(strip(res), indent=1)
+
+
+def error_text(rep):
+    err, det = rep.get("error") or "failed", (rep.get("errorDetails") or "").strip()
+    if err == "Command Not Found":
+        return unknown_command(re.sub(r".*No command named '([^']+)'.*", r"\1", det, flags=re.S))
+    det = re.sub(r"\s*Available: \[.*\]", "", det, flags=re.S)
+    msg = det if err in ("Parameter Validation Failed", "Bad Request", "Internal Server Error") and det else (err + (": " + det if det else ""))
+    return msg[:1500]
+
+
+# ── activity log (shown in the editor's Claude Activity window) ─────────────
+
+def refs_of(params, result):
+    refs = []
+    for k in ("target", "root", "path", "parent", "asset", "sprites"):
+        v = params.get(k) if isinstance(params, dict) else None
+        if isinstance(v, str):
+            refs.append(v)
+    text = result.get("text") if isinstance(result, dict) else None
+    if isinstance(text, str):  # apply/set reports: "+ /Level/Player:Rigidbody2D …"
+        refs += re.findall(r"^[+~] (/[^\s:]+|Assets/\S+?\.prefab)", text, re.M)
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in ("globalId", "tilemap", "sprite", "hierarchyPath", "assetPath") and isinstance(v, str):
+                    refs.append(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o[:20]:
+                walk(v)
+    walk(result)
+    seen = []
+    for r in refs:
+        if r.startswith(("Assets/", "Packages/", "/", "GlobalObjectId")) and r not in seen:
+            seen.append(r)
+    return seen[:20]
+
+
+def log_activity(kind, cmd, params, ok=True, ms=0, err=None, result=None):
+    try:
+        os.makedirs(os.path.dirname(ACTIVITY), exist_ok=True)
+        if isinstance(params, dict) and cmd == "apply":
+            args = (params.get("text") or "").strip().replace("\n", " ⏎ ")
+        else:
+            args = params if isinstance(params, str) else json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+        if len(args) > 300:
+            args = args[:300] + "…"
+        entry = {"t": datetime.now().strftime("%H:%M:%S"), "kind": kind, "cmd": cmd, "args": args, "ok": ok, "ms": ms,
+                 "write": kind == "cmd" and not cmd.startswith(READ_PREFIXES) and not (cmd == "menu" and isinstance(params, dict) and params.get("list")),
+                 "err": err, "refs": refs_of(params, result)}
+        with open(ACTIVITY, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+# ── running commands ────────────────────────────────────────────────────────
+
+def run(command, params, show=True):
+    """Execute; print the rendered result (or raise Fail). Returns the result payload."""
+    t = time.time()
+    rep = call(command, params)
+    ms = int((time.time() - t) * 1000)
+    ok = bool(rep.get("success"))
+    err = None if ok else error_text(rep)
+    if command not in ("note", "console", "editor_status"):
+        log_activity("cmd", command, params, ok, ms, err, rep.get("result"))
+    if RAW and show:
+        print(json.dumps(rep, indent=1))
+        if not ok:
+            raise Fail(err)
+        return rep.get("result")
+    if not ok:
+        raise Fail(err)
+    for w in rep.get("warnings") or []:
+        print("warning: " + w, file=sys.stderr)
+    if show:
+        out(render(rep.get("result")))
+    return rep.get("result")
+
+
+def editor_state():
+    _, rep = http("POST", "/api/exec", {"command": "editor_status", "parameters": {}}, timeout=5)
+    return rep.get("result") or {}
+
+
+# ── auto-sync: import files written from the shell before talking to the editor ──
+
+def changed_files(since):
+    roots = [os.path.join(PROJECT, "Assets")]
+    pk = os.path.join(PROJECT, "Packages")
+    if os.path.isdir(pk):
+        roots += [os.path.join(pk, d) for d in os.listdir(pk) if os.path.isdir(os.path.join(pk, d))]
+    found = []
+    stack = list(roots)
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif os.path.splitext(e.name)[1].lower() in SYNC_EXT and e.stat().st_mtime > since:
+                        found.append(e.path)
+        except OSError:
+            pass
+    return found
+
+
+def touch_stamp():
+    os.makedirs(STATE, exist_ok=True)
+    with open(STAMP, "a"):
+        os.utime(STAMP, None)
+
+
+def autosync():
+    try:
+        since = os.path.getmtime(STAMP)
+    except OSError:
+        touch_stamp()
+        return
+    files = changed_files(since)
+    if files:
+        code = any(f.endswith((".cs", ".asmdef", ".asmref")) for f in files)
+        names = ", ".join(os.path.basename(f) for f in files[:4]) + (" +%d" % (len(files) - 4) if len(files) > 4 else "")
+        sync(prefix="auto-sync (%s): " % names, wait_compile=code)
+
+
+def sync(prefix="", wait_compile=True):
+    t0 = time.time()
+    try:
+        run("refresh", {}, show=False)
+    except Fail as e:
+        if "unknown command" not in str(e):
+            raise
+        run("eval", {"code": "UnityEditor.AssetDatabase.Refresh(); return 1;", "timeout": 120000}, show=False)
+    saw_busy = False
+    if wait_compile:
+        stable, deadline = 0, time.time() + 300
+        time.sleep(0.5)
+        while time.time() < deadline:
+            try:
+                st = editor_state()
+                busy = st.get("compiling") or st.get("domainReloadInProgress") or st.get("status") != "ready"
+            except EditorDown:
+                busy = True
+            saw_busy |= bool(busy)
+            stable = 0 if busy else stable + 1
+            if stable >= 2:
+                break
+            time.sleep(0.3)
+        else:
+            raise Fail("timed out waiting for the editor to finish compiling")
+    touch_stamp()
+    try:
+        res = run("compile_errors", {}, show=False) or {}
+    except Fail:
+        c = run("console", {"tail": 40, "level": "error"}, show=False) or {}
+        res = {"failed": (c.get("groundTruth") or {}).get("compilationFailed"),
+               "text": "\n".join((e.get("message") or "").split("\n")[0] for e in c.get("entries", []))}
+    text = (res.get("text") or "").strip()
+    took = time.time() - t0
+    if saw_busy:
+        invalidate_schema()
+    if res.get("failed"):
+        log_activity("cmd", "sync", "compile failed", ok=False, err=text[:300])
+        raise Fail("%sCOMPILE FAILED (%.1fs)\n%s" % (prefix, took, text))
+    errors_only = "\n".join(l for l in text.split("\n") if l.startswith("error"))
+    print("%s%s (%.1fs)%s" % (prefix, "recompiled" if saw_busy else "imported", took, ("\n" + errors_only) if errors_only else ""))
+    log_activity("cmd", "sync", prefix + ("recompiled" if saw_busy else "imported"), ok=True, ms=int(took * 1000))
+
+
+# ── composite commands ──────────────────────────────────────────────────────
+
+def cmd_sync(_):
+    sync()
+
+
+def cmd_ls(args):
+    a = [x for x in args if x not in ("-v", "--values")]
+    params = bind("snapshot", a)
+    if len(a) != len(args):
+        params["values"] = True
+    run("snapshot", params)
+
+
+def cmd_set(args):
+    if args and not KV.match(args[0]) and not args[0].startswith("{"):
+        params = {"target": args[0], "values": {}}
+        for a in args[1:]:
+            m = KV.match(a)
+            if not m:
+                raise Fail("set: expected Component.prop=value, got %r" % a)
+            if m.group(1) == "importer":
+                params["importer"] = m.group(2).lower() in ("1", "true")
+            else:
+                params["values"][m.group(1)] = smart(m.group(2))
+        run("set", params)
+    else:
+        run("set", bind("set", args))
+
+
+def cmd_apply(args):
+    params = {}
+    rest = []
+    for a in args:
+        if a == "-":
+            params["text"] = sys.stdin.read()
+        elif not KV.match(a) and not a.startswith("--") and os.path.isfile(a):
+            params["text"] = open(a).read()
+        else:
+            rest.append(a)
+    params.update(bind("apply", rest) if rest else {})
+    if "text" not in params and not sys.stdin.isatty():
+        params["text"] = sys.stdin.read()
+    if "\n" not in params.get("text", "") and "\\n" in params.get("text", ""):
+        params["text"] = params["text"].replace("\\n", "\n")
+    if not params.get("text", "").strip():
+        raise Fail("apply: give a file, '-' (stdin) or text=…")
+    run("apply", params)
+
+
+def cmd_rm(args):
+    if not args:
+        raise Fail("usage: u rm <handle> …")
+    for h in args:
+        if h.startswith(("Assets/", "Packages/")):
+            run("delete_asset", {"asset": h, "confirm": True}, show=False)
+        else:
+            run("apply", {"text": "@root %s\n!%s" % (h.rsplit("/", 1)[0] or "/", h.rsplit("/", 1)[1])}, show=False)
+        print("deleted " + h)
+
+
+def flatten(text):
+    """Scene text → self-describing entries ('/A/B#2 attrs', '/A/B#2:Comp values') so diffs need no context."""
+    entries, stack, counts = [], [], {}
+    for raw in text.splitlines():
+        body = raw.strip()
+        if not body or body.startswith(("#", "…")):
+            continue
+        if body.startswith("@root "):
+            stack = [(-1, body[6:].strip())]
+            continue
+        level = (len(raw) - len(raw.lstrip(" "))) // 2
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        parent = stack[-1][1] if stack else ""
+        if body[0] in "+-":
+            head, _, rest = body[1:].partition(" ")
+            entries.append("%s:%s %s" % (parent, head, rest))
+            continue
+        m = re.match(r'^("(?:[^"\\]|\\.)*"|.+?)(?=\s+[\w.]+=|\s+\[|$)(.*)$', body)
+        name, rest = (m.group(1), m.group(2)) if m else (body, "")
+        key = (parent, name)
+        counts[key] = counts.get(key, 0) + 1
+        path = "%s/%s%s" % (parent, name, "#%d" % counts[key] if counts[key] > 1 else "")
+        stack.append((level, path))
+        entries.append(path + rest)
+    return entries
+
+
+def cmd_diff(args):
+    root = args[0] if args else None
+    params = {"values": True, "expand": True, "max_lines": 20000}
+    if root:
+        params["root"] = root
+    text = (run("snapshot", params, show=False) or {}).get("text", "")
+    os.makedirs(os.path.join(STATE, "diff"), exist_ok=True)
+    base = os.path.join(STATE, "diff", hashlib.md5((root or "<scene>").encode()).hexdigest() + ".txt")
+    old = open(base).read() if os.path.exists(base) else None
+    with open(base, "w") as f:
+        f.write(text)
+    if old is None:
+        print("baseline saved — the next `u diff` shows what changed since now")
+        return
+    a, b = flatten(old), flatten(text)
+    lines = [("- " if l[0] == "-" else "+ ") + l[1:].strip() for l in difflib.unified_diff(a, b, lineterm="", n=0)
+             if l[:1] in "+-" and not l.startswith(("---", "+++"))]
+    out("\n".join(lines) if lines else "no changes since the last diff")
+
+
+def cmd_shot(args):
+    view, name, kv = "area", None, []
+    for a in args:
+        if a in ("game", "scene", "area"):
+            view = a
+        elif KV.match(a):
+            kv.append(a)
+        elif a.startswith(("/", "Assets/")):
+            kv.append("target=" + a)
+        else:
+            name = a
+    cmd = "capture_area" if view == "area" else "capture_%s_view" % view
+    params = bind(cmd, kv)
+    params.setdefault("width", 640)
+    if view != "area":
+        params.setdefault("height", 360)
+    if view == "game" and "source" not in params:
+        try:
+            params["source"] = "screen" if editor_state().get("playMode") in ("playing", "paused") else "camera"
+        except EditorDown:
+            params["source"] = "camera"
+    res = run(cmd, params, show=False) or {}
+    b64 = next((v for v in res.values() if isinstance(v, str) and len(v) > 200), None)
+    if not b64:
+        raise Fail("no image in reply: %s" % json.dumps(strip(res))[:300])
+    os.makedirs(STATE, exist_ok=True)
+    path = os.path.join(STATE, (name or "%s-%s" % (view, datetime.now().strftime("%H%M%S"))) + ".png")
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(b64))
+    meta = " ".join("%s=%s" % (k, v) for k, v in res.items() if k in ("area", "unitsPerPixel", "width", "height"))
+    print(path + ("  " + meta if meta else ""))
+
+
+def cmd_note(args):
+    text = " ".join(args)
+    log_activity("note", "note", text)
+    try:
+        call("note", {"text": text}, retry_for=3)
+    except (EditorDown, Fail):
+        pass
+    print("noted")
+
+
+def console_since(level="warn", tail=200, everything=False):
+    params = {"tail": tail, "level": level}
+    if not everything:
+        try:
+            with open(CURSOR) as f:
+                c = json.load(f)
+            params.update(since=c["cursor"], since_session=c["session"])
+        except (OSError, ValueError, KeyError):
+            pass
+    res = run("console", params, show=False) or {}
+    os.makedirs(STATE, exist_ok=True)
+    with open(CURSOR, "w") as f:
+        json.dump({"cursor": res.get("cursor"), "session": res.get("session")}, f)
+    return res
+
+
+def print_entries(res, limit=25):
+    """Dedupe repeats (×n), keep the first project stack frame, cap the count."""
+    rows, index = [], {}
+    for e in res.get("entries", []):
+        msg = (e.get("message") or "").strip()
+        if "/api/exec" in msg or msg.startswith(("ExecuteCommandByName", "[Pipeline]")):
+            continue
+        first = msg.split("\n")[0][:300]
+        st = (e.get("stackTrace") or e.get("stacktrace") or "").split("\n")
+        loc = next((l.strip() for l in st if "Assets/" in l), "")
+        loc = re.sub(r".*\(at (Assets/[^)]+)\).*", r"\1", loc)
+        key = (first, loc)
+        if key in index:
+            rows[index[key]][3] += 1
+            continue
+        index[key] = len(rows)
+        rows.append([(e.get("level") or e.get("type") or "?")[:5], first, loc, 1])
+    lines = ["%s %s%s%s" % (lv, msg, ("  @ " + loc) if loc else "", (" ×%d" % n) if n > 1 else "") for lv, msg, loc, n in rows]
+    if len(lines) > limit:
+        lines = lines[:limit] + ["… %d more distinct entries" % (len(lines) - limit)]
+    if (res.get("groundTruth") or {}).get("compilationFailed"):
+        lines.append("!! scripts don't compile — `u sync` shows the errors")
+    if lines:
+        out("\n".join(lines))
+    return len(rows)
+
+
+def cmd_errors(args):
+    if print_entries(console_since("warn", 200, bool(args and args[0] == "all"))) == 0:
+        print("no new warnings/errors")
+
+
+def cmd_logs(args):
+    if print_entries(console_since("log", 200, bool(args and args[0] == "all")), limit=40) == 0:
+        print("no new console output")
+
+
+def wait_play_state(want, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if (editor_state().get("playMode") in ("playing", "paused")) == want:
+                return True
+        except EditorDown:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def cmd_play(args):
+    secs = next((float(a) for a in args if re.match(r"^[0-9.]+$", a)), 3.0)
+    console_since("log", 1)
+    run("editor_play", {}, show=False)
+    if not wait_play_state(True):
+        raise Fail("didn't enter play mode (compile errors? `u sync`)")
+    log_activity("cmd", "play", "running %.1fs" % secs)
+    time.sleep(secs)
+    if "noshot" not in args:
+        cmd_shot(["game", "play-%s" % datetime.now().strftime("%H%M%S")])
+    if print_entries(console_since("log", 200), limit=30) == 0:
+        print("(no console output)")
+    if "keep" in args:
+        print("still playing — `u editor_stop` when done")
+    else:
+        run("editor_stop", {}, show=False)
+        wait_play_state(False)
+        print("stopped")
+
+
+def cmd_run(args):
+    if not args:
+        raise Fail("usage: u run <file.cs> [Type.Method] [json-args]")
+    params = {"file": os.path.relpath(os.path.abspath(args[0]), PROJECT)}
+    if len(args) > 1:
+        params["entry"] = args[1]
+    if len(args) > 2:
+        params["args"] = json.loads(args[2])
+    rep = call("run_script", params)
+    log_activity("cmd", "run_script", params, bool(rep.get("success")), 0, None if rep.get("success") else error_text(rep))
+    res = rep.get("result") or {}
+    diags = [d for d in (res.get("diagnostics") or []) if d.get("severity") in ("error", "Error", "warning", "Warning")]
+    for d in diags[:15]:
+        print("%s %s" % (d.get("severity", ""), d.get("message") or json.dumps(d)), file=sys.stderr)
+    if not rep.get("success"):
+        raise Fail(error_text(rep))
+    out(render(res.get("result")))
+
+
+def cmd_cmds(args):
+    q = "&query=" + urllib.parse.quote(args[0]) if args else ""
+    _, rep = http("GET", "/api/commands?detail=compact" + q)
+    rows = sorted(rep.get("commands", []), key=lambda c: c["name"])
+    out("\n".join("%-26s %s" % (c["name"], c.get("description", "")[:90]) for c in rows))
+
+
+def cmd_help(args):
+    if not args:
+        print(__doc__)
+        return
+    name = ALIASES.get(args[0], args[0])
+    _, rep = http("GET", "/api/commands?detail=full&query=" + urllib.parse.quote(name))
+    for c in rep.get("commands", []):
+        if c["name"] != name:
+            continue
+        print("%s — %s" % (c["name"], c.get("description", "")))
+        for p in c.get("parameters", []):
+            dv = p.get("defaultValue")
+            print("  %s%-16s %-9s %s%s" % ("*" if p.get("required") else " ", p.get("name"), p.get("type", ""), p.get("description", ""),
+                                          (" [%s]" % dv) if dv not in (None, "") else ""))
+        return
+    raise Fail(unknown_command(name))
+
+
+def cmd_wait(_):
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        try:
+            _, rep = http("GET", "/api/status", timeout=5)
+            if rep.get("status") == "ready":
+                print("ready")
+                return
+        except EditorDown:
+            pass
+        time.sleep(1)
+    raise Fail("editor not ready after 300s")
+
+
+def cmd_status(_):
+    st = editor_state()
+    print(" ".join("%s=%s" % (k, st[k]) for k in ("status", "playMode", "compiling") if k in st))
+
+
+COMPOSITE = {"sync": cmd_sync, "ls": cmd_ls, "set": cmd_set, "apply": cmd_apply, "rm": cmd_rm, "diff": cmd_diff,
+             "shot": cmd_shot, "note": cmd_note, "errors": cmd_errors, "logs": cmd_logs, "play": cmd_play, "run": cmd_run,
+             "cmds": cmd_cmds, "help": cmd_help, "wait": cmd_wait, "status": cmd_status}
+
+
+def dispatch(args):
+    name = args[0]
+    if name not in NO_AUTOSYNC:
+        autosync()
+    try:
+        if name in COMPOSITE:
+            COMPOSITE[name](args[1:])
+        else:
+            cmd = ALIASES.get(name, name)
+            run(cmd, bind(cmd, args[1:]))
+    finally:
+        if name not in NO_AUTOSYNC and os.path.exists(STAMP):
+            touch_stamp()
+
+
+def batch(lines):
+    """One command per line. `apply <<END` … `END` embeds multi-line scene text."""
+    n, i = 0, 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith("#"):
+            continue
+        n += 1
+        m = re.match(r"^(apply)\s*(.*?)<<\s*(\w+)$", line)
+        try:
+            if m:
+                body = []
+                while i < len(lines) and lines[i].strip() != m.group(3):
+                    body.append(lines[i])
+                    i += 1
+                i += 1
+                dispatch(["apply", "text=" + "\n".join(body)] + shlex.split(m.group(2)))
+                continue
+            dispatch(shlex.split(line))
+        except Fail as e:
+            print("✗ line %d `%s`\n%s" % (n, line[:120], e), file=sys.stderr)
+            print("(stopped; earlier lines were applied)", file=sys.stderr)
+            sys.exit(1)
+
+
+def main():
+    sys.stdout.reconfigure(line_buffering=True)
+    try:
+        if not ARGV:
+            if sys.stdin.isatty():
+                print(__doc__)
+                return
+            batch(sys.stdin.read().splitlines())
+            return
+        if ARGV[0] in ("-h", "--help"):
+            print(__doc__)
+            return
+        dispatch(ARGV)
+    except Fail as e:
+        print("ERROR " + str(e), file=sys.stderr)
+        sys.exit(1)
+    except EditorDown as e:
+        print("EDITOR DOWN: %s" % e, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
