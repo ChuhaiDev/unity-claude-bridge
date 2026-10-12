@@ -114,7 +114,7 @@ def main():
         if manifest["name"] != name:
             continue  # renamed since; old name isn't served by this packument
         blob = tarball(files)
-        fname = "%s-%s.tgz" % (name, v)
+        fname = "%s-%s.tar.gz" % (name, v)  # not .tgz: Pages gzips octet-stream again, breaking UPM size checks
         with open(os.path.join(args.out, "tarballs", fname), "wb") as f:
             f.write(blob)
         manifest.update({"_id": "%s@%s" % (name, v),
